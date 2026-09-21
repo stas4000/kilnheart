@@ -2,13 +2,13 @@
 // Simulation is authoritative: contact events resolve damage, visuals only follow.
 import * as T from 'three';
 import {
-  makeRenderer, makeScene, CameraRig, Input, Audio, Particles, Rings, contactShadow, autoQuality,
+  makeRenderer, makeScene, CameraRig, Input, Audio, Particles, Rings, contactShadow, autoQuality, aimMarker,
   PAL, clamp, lerp, rand, pick, angDiff, IS_TOUCH, LOW, REDUCED
-} from './engine.js';
+} from './engine.js?v=20260921';
 import {
   seeded, makeHero, makeHusk, makeShardling, makeBrute, makeKilnwright,
   makePot, makeGate, buildWorld, ZONES, CORRIDORS, insideWorld
-} from './clay.js';
+} from './clay.js?v=20260921';
 
 const Q = new URLSearchParams(location.search);
 const DEBUG_ZONE = Q.has('zone') ? clamp(+Q.get('zone'), 0, 3) : 0;
@@ -57,6 +57,7 @@ const rings = new Rings(scene);
 const rng = seeded(20260725);
 const world = buildWorld(scene, rng);
 const quality = autoQuality(renderer, key);
+const marker = IS_TOUCH ? null : aimMarker(scene); // desktop only: shows where W is heading
 
 const ui = {
   hp: document.getElementById('hpFill'), ch: document.getElementById('chFill'),
@@ -283,8 +284,28 @@ function hurtPlayer(dmg, fromX, fromZ, kb = 0) {
   if (player.hp <= 0) { player.hp = 0; lose(); }
 }
 
+// touch aim assist: the nearest live enemy inside mallet reach plus the lunge, and inside a wide
+// front cone while the stick is held (so running away never snaps the hero round). One pass per swing.
+const ASSIST = { reach: 2.6, cone: 1.75 };
+function assistTarget(a, moving) {
+  const range = a.range * player.rangeMul + ASSIST.reach;
+  let best = null, bd = Infinity;
+  for (const e of G.enemies) {
+    if (e.dead || e.state === 'rise') continue;
+    const dx = e.x - player.x, dz = e.z - player.z, d = Math.hypot(dx, dz) - e.def.radius;
+    if (d > range || d >= bd) continue;
+    if (moving && d > 1 && Math.abs(angDiff(Math.atan2(dx, dz), player.face)) > ASSIST.cone) continue;
+    best = e; bd = d;
+  }
+  return best;
+}
+
 function playerAttack() {
   const a = COMBO[player.step];
+  if (input.usingTouch) {
+    player.target = assistTarget(a, input.move.lengthSq() > 0.01);
+    if (player.target) player.face = Math.atan2(player.target.x - player.x, player.target.z - player.z);
+  }
   player.atk = { def: a, t: 0, hits: new Set() };
   player.queued = false;
   audio.sfx('swing');
@@ -355,12 +376,14 @@ function shootShard(e, tx, tz) {
 
 // ------------------------------------------------------------------ updates
 function updatePlayer(dt) {
-  const mv = input.moveVector(new T.Vector2());
-  const aim = input.aimPoint(player);
+  input.aimPoint(player); // before moveVector: desktop movement is relative to the hero->cursor line
+  const mv = input.moveVector(new T.Vector2(), player, dt);
 
-  // face: aim on desktop, movement on touch
+  // face: the stable cursor direction on desktop; on touch the assisted target while swinging, else movement
+  const tg = player.atk && player.target && !player.target.dead ? player.target : null;
   const wantFace = (!input.usingTouch)
-    ? Math.atan2(aim.x - player.x, aim.z - player.z)
+    ? Math.atan2(input.dir.x, input.dir.z)
+    : tg ? Math.atan2(tg.x - player.x, tg.z - player.z)
     : (mv.lengthSq() > 0.01 ? Math.atan2(mv.x, mv.y) : player.face);
   if (player.dashT <= 0) player.face = wantFace;
 
@@ -416,7 +439,7 @@ function updatePlayer(dt) {
     else if (t >= a.startup && t < a.startup + a.active) resolveSwing();
     if (t >= a.startup + a.active + a.recovery) {
       const wasLast = player.step >= COMBO.length - 1;
-      player.atk = null;
+      player.atk = null; player.target = null;
       if (player.queued && !wasLast) { player.step++; player.comboT = 0.7; playerAttack(); }
       else { player.step = 0; player.comboT = 0; }
     } else if (player.queued && t >= a.startup + a.active && player.step < COMBO.length - 1) {
@@ -745,6 +768,12 @@ function frame(now) {
 
   const aim = input.aim;
   rig.follow(player.x, player.z, aim.x, aim.z, dt);
+  if (marker) {
+    marker.root.visible = G.state === 'play' && input.aimLive && !player.dead;
+    marker.root.position.set(aim.x, 0.07, aim.z);
+    const s = REDUCED ? 1 : 1 + Math.sin(now * 0.005) * 0.07;
+    marker.ring.scale.set(s, s, s);
+  }
   key.position.set(player.x + 24, 42, player.z + 18);
   key.target.position.set(player.x, 0, player.z);
   key.target.updateMatrixWorld();

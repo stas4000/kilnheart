@@ -115,6 +115,37 @@ export class CameraRig {
 }
 
 // ---------------------------------------------------------------- input
+// Desktop movement is cursor-relative: W runs at the aim point, S backs away, A/D strafe around it
+// (D = the hero's right when facing the aim point). Pure, so controls.check.mjs can assert it under node.
+// fwd/strafe are key axes in -1..1, `last` is the last stable hero->aim unit direction {x,z}: it is
+// updated in place and only while the aim point is far enough to give a direction, so nothing flips
+// or turns NaN when the hero stands on the cursor. Returns the world move vector in `out` {x,z}.
+// With a dt the direction also turns at a capped rate while the cursor is close (the cap grows with the
+// distance and is gone past AIM_FULL): strafing with the cursor on the hero then opens into a calm circle
+// instead of spinning on the spot, and far aiming stays instant.
+export const AIM_DEAD = 0.6, AIM_FULL = 2.4; // W fades from full to nothing between these distances
+export const AIM_TURN = 14;                  // rad/s the direction may turn at AIM_FULL, scaled down closer in
+export function cursorMove(fwd, strafe, hx, hz, ax, az, last, out = { x: 0, z: 0 }, dt = 0) {
+  const dx = ax - hx, dz = az - hz, d = Math.hypot(dx, dz);
+  if (!(Math.hypot(last.x, last.z) > 0.5)) { last.x = 0; last.z = 1; }
+  if (d > AIM_DEAD * 0.5) {
+    const nx = dx / d, nz = dz / d, cap = dt > 0 && d < AIM_FULL ? AIM_TURN * (d / AIM_FULL) * dt : Infinity;
+    const turn = Math.atan2(last.x * nz - last.z * nx, last.x * nx + last.z * nz); // signed angle last -> new
+    if (Math.abs(turn) <= cap) { last.x = nx; last.z = nz; }
+    else {
+      const a = Math.sign(turn) * cap, c = Math.cos(a), sn = Math.sin(a), lx = last.x;
+      last.x = lx * c - last.z * sn; last.z = lx * sn + last.z * c;
+    }
+  }
+  const t = d > AIM_DEAD ? Math.min(1, (d - AIM_DEAD) / (AIM_FULL - AIM_DEAD)) : 0;
+  const f = fwd > 0 ? fwd * t * t * (3 - 2 * t) : fwd; // only the push toward the cursor falls off
+  let x = last.x * f - last.z * strafe, z = last.z * f + last.x * strafe;
+  const len = Math.hypot(x, z);
+  if (len > 1) { x /= len; z /= len; }
+  out.x = x; out.z = z;
+  return out;
+}
+
 export class Input {
   constructor(rig) {
     this.rig = rig;
@@ -126,6 +157,9 @@ export class Input {
     this._pt = new T.Vector3();
     this.pointerPx = { x: innerWidth / 2, y: innerHeight / 2 };
     this.usingTouch = IS_TOUCH;
+    this.dir = { x: 0, z: 1 };  // last stable hero->aim direction, drives facing and A/D on desktop
+    this.aimLive = false;       // false until the mouse is seen, and again once it leaves the window
+    this._mv = { x: 0, z: 0 };
 
     addEventListener('keydown', e => {
       if (e.repeat) return;
@@ -138,11 +172,15 @@ export class Input {
     addEventListener('keyup', e => this.keys.delete(e.key.toLowerCase()));
     addEventListener('blur', () => { this.keys.clear(); this.attackHeld = false; });
 
-    addEventListener('pointermove', e => { if (e.pointerType !== 'touch') { this.pointerPx.x = e.clientX; this.pointerPx.y = e.clientY; } });
+    const seen = e => { this.pointerPx.x = e.clientX; this.pointerPx.y = e.clientY; this.aimLive = true; };
+    addEventListener('pointermove', e => { if (e.pointerType !== 'touch') seen(e); });
+    // cursor left the window: keep walking and facing the last direction instead of chasing a stale pixel
+    document.documentElement.addEventListener('pointerleave', e => { if (e.pointerType !== 'touch') this.aimLive = false; });
     addEventListener('pointerdown', e => {
       const t = e.target; // may be window/document, not only an element
-      if (e.pointerType === 'touch' || (t && t.closest && t.closest('#touch,.over,#cards,button,.card'))) return;
-      this.pointerPx.x = e.clientX; this.pointerPx.y = e.clientY;
+      if (e.pointerType === 'touch') return;
+      seen(e); // the click on PLAY or a card is where the cursor still is when play resumes
+      if (t && t.closest && t.closest('#touch,.over,#cards,button,.card')) return;
       if (e.button === 0) { this.attackHeld = true; this.pressed.attack = true; }
       if (e.button === 2) this.pressed.burst = true;
     });
@@ -153,45 +191,73 @@ export class Input {
   }
   _touch() {
     document.getElementById('touch').classList.add('on'); // body.touch is set in index.html
-    const stick = document.getElementById('stick'), knob = document.getElementById('knob');
+    const zone = document.getElementById('szone'), stick = document.getElementById('stick'), knob = document.getElementById('knob');
     let sid = null, cx = 0, cy = 0;
-    const R = 52;
+    const R = 52, DEAD = 0.12;
+    const cap = (el, id) => { try { el.setPointerCapture(id); } catch { /* synthetic pointer from the QA scripts */ } };
+    // floating stick: the origin is wherever the thumb lands. CSS only clamps the drawn base inside the screen
+    // and the safe area, the math keeps the true origin so a touch at the very edge never starts deflected.
+    const place = (x, y) => { cx = x; cy = y; stick.style.setProperty('--sx', x + 'px'); stick.style.setProperty('--sy', y + 'px'); };
     const startStick = e => {
-      const b = stick.getBoundingClientRect(); cx = b.left + b.width / 2; cy = b.top + b.height / 2;
-      sid = e.pointerId; stick.setPointerCapture(sid); moveStick(e);
+      if (sid !== null || e.pointerType === 'mouse') return;
+      e.preventDefault();
+      sid = e.pointerId; cap(zone, sid);
+      place(e.clientX, e.clientY); stick.classList.add('on'); moveStick(e);
     };
     const moveStick = e => {
       if (e.pointerId !== sid) return;
-      let dx = e.clientX - cx, dy = e.clientY - cy;
-      const d = Math.hypot(dx, dy) || 1;
-      const c = Math.min(1, d / R);
-      dx = dx / d * c; dy = dy / d * c;
-      this.move.set(dx, dy);
-      knob.style.transform = `translate(${dx * R}px,${dy * R}px)`;
+      let dx = e.clientX - cx, dy = e.clientY - cy, d = Math.hypot(dx, dy) || 1;
+      if (d > R * 1.35) { // the base trails a far thumb, so reversing never needs a long drag back
+        place(cx + dx / d * (d - R * 1.35), cy + dy / d * (d - R * 1.35));
+        dx = e.clientX - cx; dy = e.clientY - cy; d = Math.hypot(dx, dy) || 1;
+      }
+      const c = Math.min(1, d / R), m = c < DEAD ? 0 : (c - DEAD) / (1 - DEAD); // analog: tilt = walk..run
+      this.move.set(dx / d * m, dy / d * m);
+      knob.style.transform = `translate(${dx / d * c * R}px,${dy / d * c * R}px)`;
     };
-    const endStick = e => { if (e.pointerId !== sid) return; sid = null; this.move.set(0, 0); knob.style.transform = ''; };
-    stick.addEventListener('pointerdown', startStick);
-    stick.addEventListener('pointermove', moveStick);
-    stick.addEventListener('pointerup', endStick);
-    stick.addEventListener('pointercancel', endStick);
+    const endStick = e => {
+      if (e && e.pointerId !== sid) return;
+      sid = null; this.move.set(0, 0); knob.style.transform = ''; stick.classList.remove('on');
+    };
+    zone.addEventListener('pointerdown', startStick);
+    zone.addEventListener('pointermove', moveStick);
+    for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) zone.addEventListener(ev, endStick);
 
+    // every button owns one pointer id and captures it: a thumb sliding off still releases on the button
+    const resets = [endStick];
     const btn = (id, down, up) => {
       const el = document.getElementById(id);
-      el.addEventListener('pointerdown', e => { e.preventDefault(); el.classList.add('hold'); down(); });
-      const off = () => { el.classList.remove('hold'); up?.(); };
-      el.addEventListener('pointerup', off); el.addEventListener('pointercancel', off); el.addEventListener('pointerleave', off);
+      let pid = null;
+      el.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        if (pid !== null) return;
+        pid = e.pointerId; cap(el, pid); el.classList.add('hold'); down();
+      });
+      const off = e => { if (e && e.pointerId !== pid) return; pid = null; el.classList.remove('hold'); up?.(); };
+      for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) el.addEventListener(ev, off);
+      resets.push(off);
     };
     btn('tAtk', () => { this.attackHeld = true; this.pressed.attack = true; }, () => { this.attackHeld = false; });
     btn('tDash', () => { this.pressed.dash = true; });
     btn('tBurst', () => { this.pressed.burst = true; });
+    const resetAll = () => resets.forEach(f => f());
+    addEventListener('blur', resetAll);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) resetAll(); });
+    // iOS Safari still pinches and rubber-bands through touch-action on some versions
+    for (const ev of ['gesturestart', 'gesturechange', 'touchmove']) document.addEventListener(ev, e => e.preventDefault(), { passive: false });
   }
-  // desired move vector in world space (screen-up = world -Z rotated to iso)
-  moveVector(out) {
+  // desired move vector in world space. Desktop: relative to the hero->cursor line (call aimPoint first).
+  // Touch, or no player given: screen-relative (screen-up = world -Z rotated to iso).
+  moveVector(out, player, dt = 0) {
     let x = 0, y = 0;
     if (this.keys.has('w') || this.keys.has('arrowup')) y -= 1;
     if (this.keys.has('s') || this.keys.has('arrowdown')) y += 1;
     if (this.keys.has('a') || this.keys.has('arrowleft')) x -= 1;
     if (this.keys.has('d') || this.keys.has('arrowright')) x += 1;
+    if (!this.usingTouch && player) {
+      const m = cursorMove(-y, x, player.x, player.z, this.aim.x, this.aim.z, this.dir, this._mv, dt);
+      return out.set(m.x, m.z);
+    }
     if (x === 0 && y === 0) { x = this.move.x; y = this.move.y; }
     const len = Math.hypot(x, y);
     if (len > 1) { x /= len; y /= len; }
@@ -205,8 +271,9 @@ export class Input {
       const m = new T.Vector2(); this.moveVector(m);
       this.aim.set(player.x + m.x * 6, 0, player.z + m.y * 6);
     } else if (!this.usingTouch) {
-      const p = this.rig.screenToGround(this.pointerPx.x, this.pointerPx.y, this._pt);
+      const p = this.aimLive && this.rig.screenToGround(this.pointerPx.x, this.pointerPx.y, this._pt);
       if (p) this.aim.copy(p);
+      else this.aim.set(player.x + this.dir.x * 6, 0, player.z + this.dir.z * 6); // no cursor: hold the last direction
     }
     return this.aim;
   }
@@ -380,6 +447,21 @@ export class Rings {
       it.m.material.opacity = it.opacity * (1 - k);
     }
   }
+}
+
+// desktop destination marker: a cream clay ring and a dot on the ground where W will take the hero.
+// No depth test: the point under the cursor is often behind a hut, and a marker you cannot see marks nothing.
+export function aimMarker(scene) {
+  const g = new T.Group();
+  const mat = c => new T.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.78, depthWrite: false, depthTest: false });
+  const ring = new T.Mesh(new T.RingGeometry(0.42, 0.6, 36), mat(PAL.cream));
+  const dot = new T.Mesh(new T.CircleGeometry(0.13, 20), mat(PAL.charcoal));
+  dot.material.opacity = 0.45;
+  ring.rotation.x = dot.rotation.x = -Math.PI / 2;
+  ring.renderOrder = 5; dot.renderOrder = 6;
+  g.add(ring, dot); g.position.y = 0.07; g.visible = false;
+  scene.add(g);
+  return { root: g, ring };
 }
 
 // soft round contact shadow that sells the toy-diorama look

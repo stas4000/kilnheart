@@ -1,7 +1,7 @@
 // KILNHEART content: procedural clay-toy models + the deterministic level layout.
 // Every shape is rounded, matte and thick. No textures, no sharp edges, no glare.
 import * as T from 'three';
-import { PAL, clayMat, contactShadow, LOW } from './engine.js';
+import { PAL, clayMat, contactShadow, LOW } from './engine.js?v=20260921';
 
 export function seeded(seed) { // mulberry32, so the world is the same every run
   let a = seed >>> 0;

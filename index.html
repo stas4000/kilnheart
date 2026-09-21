@@ -12,7 +12,8 @@
 <style>
   *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{width:100%;height:100%;overflow:hidden;background:#efe0cc;touch-action:none;
-    font-family:Roboto,"Segoe UI",system-ui,-apple-system,sans-serif;color:#4a3b33;user-select:none}
+    font-family:Roboto,"Segoe UI",system-ui,-apple-system,sans-serif;color:#4a3b33;user-select:none;
+    -webkit-user-select:none;-webkit-touch-callout:none;overscroll-behavior:none}
   canvas{display:block;width:100%;height:100%}
   #hud{position:fixed;inset:0;pointer-events:none;z-index:5;
     padding:calc(14px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right)) calc(14px + env(safe-area-inset-bottom)) calc(14px + env(safe-area-inset-left))}
@@ -45,8 +46,15 @@
   /* touch controls */
   #touch{position:fixed;inset:0;z-index:6;display:none}
   #touch.on{display:block}
-  #stick{position:absolute;left:calc(26px + env(safe-area-inset-left));bottom:calc(26px + env(safe-area-inset-bottom));
+  /* floating stick: the left half is the pad, engine.js drops the base under the thumb through --sx/--sy
+     and the clamps keep the drawn base inside the screen and the safe area */
+  #szone{position:absolute;left:0;top:0;bottom:0;width:50%;touch-action:none}
+  #stick{--h:66px;--sx:calc(26px + var(--h));--sy:calc(100% - 26px - var(--h));position:absolute;
+    left:max(calc(8px + var(--h) + env(safe-area-inset-left)),var(--sx));
+    top:clamp(calc(8px + var(--h) + env(safe-area-inset-top)),var(--sy),calc(100% - 8px - var(--h) - env(safe-area-inset-bottom)));
+    transform:translate(-50%,-50%);opacity:0;transition:opacity .12s;pointer-events:none;
     width:132px;height:132px;border-radius:50%;background:rgba(255,250,242,.4);box-shadow:0 4px 0 rgba(120,95,80,.12)}
+  #stick.on{opacity:1}
   #knob{position:absolute;left:50%;top:50%;width:56px;height:56px;margin:-28px 0 0 -28px;border-radius:50%;
     background:rgba(255,250,242,.92);box-shadow:0 4px 0 rgba(120,95,80,.2)}
   #tbtns{position:absolute;right:calc(20px + env(safe-area-inset-right));bottom:calc(24px + env(safe-area-inset-bottom));
@@ -72,6 +80,12 @@
   .btn.alt:active{box-shadow:0 3px 0 #6d93ad}
   .keys{margin-top:26px;display:flex;flex-wrap:wrap;gap:8px 18px;justify-content:center;font-size:12px;opacity:.6;letter-spacing:1px}
   .keys span b{background:rgba(255,255,255,.7);border-radius:6px;padding:3px 8px;margin-right:6px;font-weight:700}
+  .keys.t,body.touch .keys.k{display:none} body.touch .keys.t{display:flex}
+  /* desktop movement hint: shows when play starts, fades out by itself */
+  #hint{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:5;
+    pointer-events:none;margin:0;opacity:0;animation:hintFade 16s ease-out;white-space:nowrap}
+  #title:not(.hide) ~ #hint,body.touch #hint{display:none}
+  @keyframes hintFade{0%,75%{opacity:.6}100%{opacity:0}}
   #cards{position:fixed;inset:0;z-index:22;display:none;flex-direction:column;align-items:center;justify-content:center;
     background:rgba(240,228,212,.9);padding:20px}
   #cards.on{display:flex}
@@ -89,7 +103,7 @@
     justify-content:center;font-size:15px;font-weight:800;color:#5d4a3f;box-shadow:0 4px 0 rgba(120,95,80,.16)}
   body.touch #skills{display:none}
   @media (max-width:820px){
-    #skills{display:none}
+    #skills,body.touch #hint{display:none}
     #vitals{width:46vw;padding:8px 10px}
     #zoneBox{top:calc(122px + env(safe-area-inset-top));background:none;box-shadow:none;padding:0}
     #zoneName{font-size:13px} #zoneSub{font-size:11px}
@@ -97,7 +111,7 @@
     #toast{top:26%}
     .tb{width:74px;height:74px;font-size:11px} .tb.big{width:92px;height:92px}
     #tbtns{grid-template-columns:repeat(2,74px)}
-    #stick{width:118px;height:118px} #knob{width:50px;height:50px;margin:-25px 0 0 -25px}
+    #stick{--h:59px;width:118px;height:118px} #knob{width:50px;height:50px;margin:-25px 0 0 -25px}
   }
 </style>
 </head>
@@ -134,7 +148,7 @@
 </div>
 
 <div id="touch">
-  <div id="stick"><div id="knob"></div></div>
+  <div id="szone"><div id="stick"><div id="knob"></div></div></div>
   <div id="tPause">II</div>
   <div id="tbtns">
     <div class="tb" id="tDash">dash</div>
@@ -147,11 +161,16 @@
   <h1>KILNHEART</h1>
   <p>You are a small clay hero in a world someone shaped by hand. The Kiln woke up and started firing everything hard, hollow and angry. Take the mallet. Smash them back into soft clay.</p>
   <button class="btn" id="playBtn">PLAY</button>
-  <div class="keys">
-    <span><b>WASD</b>move</span><span><b>Mouse</b>aim</span><span><b>Click</b>mallet</span>
-    <span><b>Space</b>dash</span><span><b>E</b>clay burst</span><span><b>P</b>pause</span>
+  <div class="keys k">
+    <span><b>Mouse</b>point the way</span><span><b>W</b>go to cursor</span><span><b>A / D</b>strafe</span><span><b>S</b>back off</span>
+    <span><b>Click</b>mallet</span><span><b>Space</b>dash</span><span><b>E</b>clay burst</span><span><b>P</b>pause</span>
+  </div>
+  <div class="keys t">
+    <span><b>Left thumb</b>drag anywhere to move</span><span><b>Hit</b>mallet, finds the nearest husk</span>
+    <span><b>Dash</b>dodge</span><span><b>Burst</b>when the kiln is charged</span>
   </div>
 </div>
+<div class="keys" id="hint"><span><b>W</b>go to cursor</span><span><b>A / D</b>strafe</span><span><b>S</b>back</span></div>
 
 <div class="over hide" id="pause">
   <h2>PAUSED</h2>
@@ -176,6 +195,8 @@
 <script type="importmap">
 {"imports":{"three":"./three.module.min.js"}}
 </script>
-<script type="module" src="./game.js"></script>
+<!-- ?v= busts the CDN cache. Bump the SAME value on every import of game.js, engine.js and clay.js
+     (here, in game.js and in clay.js): a module reached under two URLs loads twice and splits its singletons. -->
+<script type="module" src="./game.js?v=20260921"></script>
 </body>
 </html>
